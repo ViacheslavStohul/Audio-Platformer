@@ -1,9 +1,9 @@
-﻿using System;
+using System;
 using System.Diagnostics.CodeAnalysis;
+using TMPro;
 using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Audio;
-using TMPro;
 
 namespace Assets.Scripts
 {
@@ -11,7 +11,8 @@ namespace Assets.Scripts
     public class PlayerMovement : MonoBehaviour
     {
         #region Public
-        public float UserStamina {
+        public float UserStamina
+        {
             private get => _userStamina;
             set
             {
@@ -47,18 +48,26 @@ namespace Assets.Scripts
 #pragma warning restore CS0649
 
         private const int SampleSize = 1024;
-        private const float MaxSpeed = 10;
-        private const float FanStrength = 5;
-        private float[] _spectrumData;
+        private const float MaxSpeed = 10f;
+        private const float FanStrength = 5f;
+        private const float CorrectingValue = 2f;
+        private const float ReferenceFrameRate = 60f;
+        private const float MaxDeltaTime = 0.05f;
+        private const float MicrophoneStartupTimeout = 1f;
+
+        private readonly float[] _spectrumData = new float[SampleSize];
         private string _microphoneName;
         private float _lowFrequencyThreshold;
         private float _middleFrequencyThreshold;
         private float _highFrequencyThreshold;
         private float _volumeThreshold;
+        private float _inputSmoothing;
+        private float _smoothedLowIntensity;
+        private float _smoothedHighIntensity;
         private float _userStamina;
-
-        private const float CorrectingValue = 2f;
-        private bool _isInFanZone = false;
+        private bool _hasAudioSample;
+        private bool _isInFanZone;
+        private Vector2 _currentPlayerMovement;
 
         private bool Grounded =>
             Physics2D.BoxCast(_collider.bounds.center, _collider.bounds.size, 0f, Vector2.down, .2f, _ground);
@@ -74,9 +83,11 @@ namespace Assets.Scripts
             _lowFrequencyThreshold = settings.LowFrequencyThreshold;
             _middleFrequencyThreshold = settings.MiddleFrequencyThreshold;
             _highFrequencyThreshold = settings.HighFrequencyThreshold;
+            _inputSmoothing = settings.InputSmoothing > 0f ? settings.InputSmoothing : 12f;
 
-            _forwardSpeedMultiplier = 70;
-            _upwardSpeedMultiplier = 70;
+            if (_forwardSpeedMultiplier <= 0f) _forwardSpeedMultiplier = 70f;
+            if (_upwardSpeedMultiplier <= 0f) _upwardSpeedMultiplier = 70f;
+
             UserStamina = 100f;
             _movementState = MovementState.Idle;
             _audioSource = gameObject.AddComponent<AudioSource>();
@@ -93,7 +104,6 @@ namespace Assets.Scripts
             if (microphones.Length == 0) throw new Exception("Unable to connect to microphone");
 
             _microphoneName = microphones[0];
-
             _staminaText.text = _microphoneName;
 
             if (_audioMixer == null) throw new NullReferenceException("Unable to find audio mixer");
@@ -106,8 +116,6 @@ namespace Assets.Scripts
             {
                 throw new NullReferenceException("Unable to find audio mixer group");
             }
-
-            _spectrumData = new float[SampleSize];
         }
 
         private void Start()
@@ -119,24 +127,29 @@ namespace Assets.Scripts
         {
             if (_playerRigidBody.bodyType == RigidbodyType2D.Static) return;
 
-            var playerMovement = CalculatePlayerMovement();
+            RefreshAudioState(Time.deltaTime);
+            _currentPlayerMovement = CalculatePlayerMovement();
+            SetAnimation(_currentPlayerMovement);
+        }
 
-            SetAnimation(playerMovement);
+        private void FixedUpdate()
+        {
+            if (_playerRigidBody.bodyType == RigidbodyType2D.Static) return;
 
-            CalculateStamina(playerMovement);
-
-            _playerRigidBody.velocity = playerMovement;
+            _currentPlayerMovement = CalculatePlayerMovement();
+            _playerRigidBody.velocity = _currentPlayerMovement;
+            CalculateStamina(_currentPlayerMovement, Time.fixedDeltaTime);
         }
 
         private void OnApplicationPause(bool pauseStatus)
         {
-            if (pauseStatus)
-            {
-                Microphone.End(_microphoneName);
-                _audioSource.Stop();
-            }
+            if (!pauseStatus) return;
+
+            Microphone.End(_microphoneName);
+            _audioSource.Stop();
+            _hasAudioSample = false;
         }
-        
+
         private void OnApplicationFocus(bool hasFocus)
         {
             if (hasFocus)
@@ -164,6 +177,7 @@ namespace Assets.Scripts
         private void OnDisable()
         {
             Microphone.End(_microphoneName);
+            _audioSource.Stop();
         }
 
         #endregion
@@ -173,44 +187,78 @@ namespace Assets.Scripts
         private float CalculateIntensity(float minFrequency, float maxFrequency)
         {
             var intensity = 0f;
-            var minIndex = Mathf.FloorToInt(minFrequency * CorrectingValue / (_audioSource.clip.frequency / (float)SampleSize));
-            var maxIndex = Mathf.FloorToInt(maxFrequency * CorrectingValue / (_audioSource.clip.frequency / (float)SampleSize));
+            var frequencyStep = _audioSource.clip.frequency / (float)SampleSize;
+            var minIndex = Mathf.Clamp(Mathf.FloorToInt(minFrequency * CorrectingValue / frequencyStep), 0, SampleSize - 1);
+            var maxIndex = Mathf.Clamp(Mathf.FloorToInt(maxFrequency * CorrectingValue / frequencyStep), minIndex, SampleSize - 1);
 
-            for (var i = minIndex; i <= maxIndex; i++) intensity += _spectrumData[i];
+            for (var i = minIndex; i <= maxIndex; i++)
+            {
+                intensity += _spectrumData[i];
+            }
 
             return intensity;
         }
 
-        private void SetAnimation(Vector2 movement)
+        private void RefreshAudioState(float deltaTime)
         {
-            _movementState = movement.x > 0 ? MovementState.Running : MovementState.Idle;
+            if (_audioSource.clip == null) return;
 
-            if (!Grounded) _movementState = MovementState.Flying;
+            _audioSource.GetSpectrumData(_spectrumData, 0, FFTWindow.BlackmanHarris);
+            var lowFrequencyIntensity = CalculateIntensity(_lowFrequencyThreshold, _middleFrequencyThreshold);
+            var highFrequencyIntensity = CalculateIntensity(_middleFrequencyThreshold, _highFrequencyThreshold);
+
+            if (!_hasAudioSample)
+            {
+                _smoothedLowIntensity = lowFrequencyIntensity;
+                _smoothedHighIntensity = highFrequencyIntensity;
+                _hasAudioSample = true;
+                return;
+            }
+
+            var blendFactor = GetBlendFactor(_inputSmoothing, deltaTime);
+            _smoothedLowIntensity = Mathf.Lerp(_smoothedLowIntensity, lowFrequencyIntensity, blendFactor);
+            _smoothedHighIntensity = Mathf.Lerp(_smoothedHighIntensity, highFrequencyIntensity, blendFactor);
+        }
+
+        private static float GetBlendFactor(float speed, float deltaTime)
+        {
+            var safeDeltaTime = Mathf.Min(deltaTime, MaxDeltaTime);
+            return 1f - Mathf.Exp(-speed * safeDeltaTime);
+        }
+
+        private MovementState GetMovementState(Vector2 movement)
+        {
+            var movementState = movement.x > 0 ? MovementState.Running : MovementState.Idle;
+
+            if (!Grounded) movementState = MovementState.Flying;
 
             if (movement is { x: 0f, y: < -.1f } || (UserStamina == 0 && movement.y != 0))
-                _movementState = MovementState.Falling;
+                movementState = MovementState.Falling;
 
+            return movementState;
+        }
+
+        private void SetAnimation(Vector2 movement)
+        {
+            _movementState = GetMovementState(movement);
             _animator.SetInteger(nameof(MovementState), (int)_movementState);
         }
 
         private Vector2 CalculatePlayerMovement()
         {
-            _audioSource.GetSpectrumData(_spectrumData, 0, FFTWindow.BlackmanHarris);
-            var lowFrequencyIntensity = CalculateIntensity(_lowFrequencyThreshold, _middleFrequencyThreshold);
-            var highFrequencyIntensity = CalculateIntensity(_middleFrequencyThreshold, _highFrequencyThreshold);
-
             var playerMovement = Vector2.zero;
 
-            if ((lowFrequencyIntensity > _volumeThreshold || highFrequencyIntensity > _volumeThreshold) &&
-                UserStamina > 0)
+            var horizontalIntensity = _smoothedLowIntensity >= _volumeThreshold ? _smoothedLowIntensity : 0f;
+            var verticalIntensity = _smoothedHighIntensity >= _volumeThreshold ? _smoothedHighIntensity : 0f;
+
+            if ((horizontalIntensity > 0f || verticalIntensity > 0f) && UserStamina > 0)
             {
-                playerMovement.x = lowFrequencyIntensity * _forwardSpeedMultiplier;
-                playerMovement.y = highFrequencyIntensity * _upwardSpeedMultiplier;
+                playerMovement.x = horizontalIntensity * _forwardSpeedMultiplier;
+                playerMovement.y = verticalIntensity * _upwardSpeedMultiplier;
             }
             else
             {
                 playerMovement.x = 0f;
-
                 playerMovement.y = _playerRigidBody.velocity.y switch
                 {
                     < 0 => _playerRigidBody.velocity.y,
@@ -219,29 +267,30 @@ namespace Assets.Scripts
                 };
             }
 
-
-            playerMovement.x = playerMovement.x > MaxSpeed ? MaxSpeed : playerMovement.x;
-            playerMovement.y = playerMovement.y > MaxSpeed ? MaxSpeed : playerMovement.y;
-            playerMovement.x = _isInFanZone ? playerMovement.x - FanStrength: playerMovement.x;
+            playerMovement.x = Mathf.Min(playerMovement.x, MaxSpeed);
+            playerMovement.y = Mathf.Min(playerMovement.y, MaxSpeed);
+            playerMovement.x = _isInFanZone ? playerMovement.x - FanStrength : playerMovement.x;
 
             return playerMovement;
         }
 
-        private void CalculateStamina(Vector2 playerMovement)
+        private void CalculateStamina(Vector2 playerMovement, float deltaTime)
         {
+            _movementState = GetMovementState(playerMovement);
+
+            var timeScale = Mathf.Min(deltaTime, MaxDeltaTime) * ReferenceFrameRate;
+
             switch (_movementState)
             {
                 case MovementState.Flying:
                 {
                     var deltaStamina = (playerMovement.y * playerMovement.x) * _staminaMultiplier;
-                    UserStamina -= deltaStamina > _minStaminaConsumption ? deltaStamina : _minStaminaConsumption;
-
+                    UserStamina -= Mathf.Max(deltaStamina, _minStaminaConsumption) * timeScale;
                     break;
                 }
                 case MovementState.Idle or MovementState.Running:
                 {
-                    if (UserStamina < 100) UserStamina += 25;
-
+                    if (UserStamina < 100) UserStamina += 25f * timeScale;
                     break;
                 }
             }
@@ -251,11 +300,24 @@ namespace Assets.Scripts
 
         private void StartMicrophoneRecord()
         {
+            _hasAudioSample = false;
+
+            if (Microphone.IsRecording(_microphoneName))
+            {
+                Microphone.End(_microphoneName);
+            }
+
+            _audioSource.Stop();
             _audioSource.clip = Microphone.Start(_microphoneName, true, 1, AudioSettings.outputSampleRate);
             _audioSource.loop = true;
+            var timeoutAt = Time.realtimeSinceStartup + MicrophoneStartupTimeout;
 
             while (!(Microphone.GetPosition(null) > 0))
             {
+                if (Time.realtimeSinceStartup >= timeoutAt)
+                {
+                    throw new TimeoutException("Unable to start microphone recording.");
+                }
             }
 
             _audioSource.Play();
