@@ -1,34 +1,31 @@
 ﻿using UnityEngine;
 
-namespace Assets.Scripts
+public class AttachToPlatform : MonoBehaviour
 {
-    public class AttachToPlatform : MonoBehaviour
+    private bool _isPlayerExiting;
+
+    private void OnCollisionEnter2D(Collision2D collision)
     {
-        private bool isPlayerExiting;
-
-        private void OnCollisionEnter2D(Collision2D collision)
+        if (collision.gameObject.name == "Player")
         {
-            if (collision.gameObject.name == "Player")
-            {
-                collision.gameObject.transform.SetParent(transform);
-            }
+            collision.gameObject.transform.SetParent(transform);
         }
+    }
 
-        private void Update()
+    private void Update()
+    {
+        if (_isPlayerExiting)
         {
-            if (isPlayerExiting)
-            {
-                isPlayerExiting = false;
-                transform.DetachChildren();
-            }
+            _isPlayerExiting = false;
+            transform.DetachChildren();
         }
+    }
 
-        private void OnCollisionExit2D(Collision2D collision)
+    private void OnCollisionExit2D(Collision2D collision)
+    {
+        if (collision.gameObject.name == "Player")
         {
-            if (collision.gameObject.name == "Player")
-            {
-                isPlayerExiting = true;
-            }
+            _isPlayerExiting = true;
         }
     }
 }

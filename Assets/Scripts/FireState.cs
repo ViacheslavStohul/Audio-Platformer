@@ -1,9 +1,6 @@
-﻿namespace Assets.Scripts
+﻿public enum FireState
 {
-    public enum FireState
-    {
-        None = 0,
-        NoFire = 1,
-        Fire = 2
-    }
+    None = 0,
+    NoFire = 1,
+    Fire = 2
 }
